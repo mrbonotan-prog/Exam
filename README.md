@@ -335,4 +335,43 @@ for i in range(5):
 # Find largest community
 comm_df.groupBy("label").count().orderBy(F.desc("count")).show(1)
 
+#Problem 2
+from pyspark.sql import SparkSession
+from pyspark.ml.feature import CountVectorizer, MinHashLSH
+from pyspark.sql import functions as F
 
+spark = SparkSession.builder.appName("MusicLSH").getOrCreate()
+
+# 1. Load data
+raw_data = spark.read.option("sep", "\t").csv("userid_songid_count.txt") \
+    .toDF("UserID", "SongID", "Count")
+
+# 2. Group into sets of songs per user
+user_sets = raw_data.groupBy("UserID").agg(F.collect_list("SongID").alias("song_list"))
+
+# 3. Vectorize (Binary/Set-based)
+cv = CountVectorizer(inputCol="song_list", outputCol="features", binary=True)
+cv_model = cv.fit(user_sets)
+vectorized_data = cv_model.transform(user_sets)
+
+# 4. Implement MinHashLSH with 100 bands (tables)
+# In Spark, numHashTables corresponds to 'b'
+mh = MinHashLSH(inputCol="features", outputCol="hashes", numHashTables=100)
+lsh_model = mh.fit(vectorized_data)
+
+def get_similar_users(target_uid, num_neighbors=10):
+    # Retrieve the vector for the specific user
+    user_row = vectorized_data.filter(F.col("UserID") == target_uid).select("features").first()
+    
+    if not user_row:
+        return "User not found."
+    
+    # Perform Approximate Nearest Neighbor Search
+    # Spark handles the banding and signature logic internally based on numHashTables
+    return lsh_model.approxNearestNeighbors(vectorized_data, user_row[0], num_neighbors) \
+        .select("UserID", "distCol") \
+        .withColumnRenamed("distCol", "Jaccard_Distance")
+
+# Example Usage:
+# results = get_similar_users("user_001")
+# results.show()
