@@ -375,3 +375,99 @@ def get_similar_users(target_uid, num_neighbors=10):
 # Example Usage:
 # results = get_similar_users("user_001")
 # results.show()
+
+
+To implement these graph algorithms using only the built-in Apache Spark libraries (Spark SQL and DataFrames) without external packages like GraphFrames, we must use **Iterative Join Patterns**. This replicates the power iteration method used in graph theory.
+### 1. Data Loading and Preparation
+First, we load the power connection data and ensure the schemas are correct.
+```python
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+from pyspark.sql.window import Window
+
+spark = SparkSession.builder.appName("PowerGridAnalysis").getOrCreate()
+
+# Load Nodes (id, topic) and Edges (src, dst)
+nodes = spark.read.csv("pc_nodes.csv", header=True, inferSchema=True)
+edges = spark.read.csv("pc_edges.csv", header=True, inferSchema=True)
+
+# Calculate Out-Degree once (required for PageRank and HITS)
+out_degrees = edges.groupBy("src").count().withColumnRenamed("count", "out_degree")
+
+```
+### 2. Personalized PageRank (Relative to Residential)
+The "Personalization" is achieved by ensuring that the 15% "jump" (reset probability) always lands on a **residential** node.
+```python
+# Filter residential nodes and count them for distribution
+res_nodes = nodes.filter(F.col("topic") == "residential").select("id")
+num_res = res_nodes.count()
+
+# Initialize: Every node starts with a rank of 1.0
+ranks = nodes.select("id", "topic", F.lit(1.0).alias("rank"))
+
+for i in range(10): # 10 iterations for convergence
+    # Step 1: Calculate contributions from source nodes to destination nodes
+    contributions = edges.join(ranks, edges.src == ranks.id) \
+                         .join(out_degrees, "src") \
+                         .select(F.col("dst"), (F.col("rank") / F.col("out_degree")).alias("contrib"))
+    
+    # Step 2: Sum contributions at the destination
+    summed_contribs = contributions.groupBy("dst").agg(F.sum("contrib").alias("total_contrib"))
+    
+    # Step 3: Apply formula with personalization
+    # Rank = (0.15 * Reset_to_Residential) + (0.85 * Summed_Contributions)
+    ranks = nodes.join(summed_contribs, nodes.id == summed_contribs.dst, "left").fillna(0) \
+        .join(res_nodes.withColumn("is_res", F.lit(1)), "id", "left").fillna(0) \
+        .withColumn("rank", 
+                    F.when(F.col("is_res") == 1, 0.15/num_res).otherwise(0) + 
+                    (0.85 * F.col("total_contrib"))) \
+        .select("id", "topic", "rank")
+
+print("Top 25 Nodes by Personalized PageRank:")
+ranks.orderBy(F.desc("rank")).select("id", "topic", "rank").show(25)
+
+```
+### 3. Hubbiness and Authority (HITS)
+In a power grid, a **Hub** is a node that points to many important delivery points, while an **Authority** is a node that receives power from many important hubs.
+```python
+# Initialize scores to 1.0
+hits = nodes.select("id", "topic", F.lit(1.0).alias("hub"), F.lit(1.0).alias("auth"))
+
+for i in range(10):
+    # Update Authority: Sum of Hub scores of nodes pointing to this node
+    auth_updates = edges.join(hits, edges.src == hits.id) \
+                        .groupBy("dst").agg(F.sum("hub").alias("new_auth"))
+    
+    hits = hits.drop("auth").join(auth_updates, hits.id == auth_updates.dst, "left").fillna(0) \
+               .withColumnRenamed("new_auth", "auth")
+    
+    # Update Hub: Sum of Authority scores of nodes this node points to
+    hub_updates = edges.join(hits, edges.dst == hits.id) \
+                       .groupBy("src").agg(F.sum("auth").alias("new_hub"))
+    
+    hits = hits.drop("hub").join(hub_updates, hits.id == hub_updates.src, "left").fillna(0) \
+               .withColumnRenamed("new_hub", "hub")
+
+    # Normalize scores (Scale by Max to prevent numeric overflow)
+    max_h = hits.select(F.max("hub")).first()[0]
+    max_a = hits.select(F.max("auth")).first()[0]
+    hits = hits.withColumn("hub", F.col("hub")/max_h).withColumn("auth", F.col("auth")/max_a)
+
+print("Top 25 Hubs:")
+hits.select("id", "topic", "hub").orderBy(F.desc("hub")).show(25)
+
+print("Top 25 Authorities:")
+hits.select("id", "topic", "auth").orderBy(F.desc("auth")).show(25)
+
+```
+### 4. Strategic Advice to the CEO
+Based on these results, here are three actionable insights for managing the power transmission network:
+#### **Advise 1: Harden Infrastructure at High-Authority Nodes**
+ * **Evidence:** The **Authority** scores highlight nodes that serve as the primary "sinks" or delivery hubs for the grid.
+ * **Action:** These nodes are critical for service continuity. I recommend the Top 25 Authorities be the first to receive hardware upgrades and redundant circuitry, as their failure would result in the largest downstream outages.
+#### **Advise 2: Enhance Security for High-Hub Substations**
+ * **Evidence:** Nodes with high **Hubbiness** are the "dispatchers" of the network. While they might not be the final delivery point, they control the flow to the most important authorities.
+ * **Action:** A failure at a high-hub node creates a cascading effect. The CEO should implement advanced "islanding" capabilities (the ability to disconnect from the main grid to prevent failure spread) at these specific locations to contain local faults.
+#### **Advise 3: Optimize Maintenance Windows using PageRank Insights**
+ * **Evidence:** The **Personalized PageRank** (relative to residential nodes) identifies the nodes that are structurally most important to the average residential consumer.
+ * **Action:** To maintain high customer satisfaction and minimize political/regulatory fallout, any scheduled maintenance on nodes with high PageRank scores should be strictly limited to off-peak hours (midnight to 4 AM), as these nodes have the most "influence" on residential power availability.
